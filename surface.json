@@ -1,0 +1,27 @@
+{
+  "id": "surface-publisher",
+  "name": "Publisher",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "description": "Share your surfaces as ready-to-use packages with automatic updates, or as open-source repositories on GitHub.",
+  "contributes": [
+    {
+      "slot": "nav",
+      "title": "Publisher",
+      "icon": "git-branch"
+    }
+  ],
+  "backend": {
+    "command": "bin/publisher-backend"
+  },
+  "methods": [
+    "app.info",
+    "sources.list",
+    "security.scan",
+    "github.status",
+    "github.connect",
+    "github.disconnect",
+    "publish.package",
+    "publish.source"
+  ]
+}
