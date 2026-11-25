@@ -16,11 +16,18 @@
   },
   "methods": [
     "app.info",
+    "job.start",
+    "job.status",
+    "cloud.account",
     "sources.list",
+    "sources.pick",
+    "sources.request_build",
     "security.scan",
     "github.status",
     "github.connect",
     "github.disconnect",
+    "publish.prepare_package",
+    "publish.prepare_source",
     "publish.package",
     "publish.source"
   ]

@@ -1,27 +1,19 @@
-import { chmod, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   GitHubStatus,
   LocalSurfaceSource,
+  PackagePrepareResult,
+  PublicationApproval,
   PublishPackageParams,
   PublishPackageResult,
   PublishSourceParams,
   PublishSourceResult,
-  SecurityFinding,
+  SecretSeverity,
   SecurityScanResult,
+  SourcePrepareResult,
 } from "../shared/types";
-
-const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "target", ".ponpoko", ".turbo", ".cache"]);
-const PACKAGE_EXCLUDE_PATTERNS = [
-  /^node_modules(\/|$)/,
-  /^\.git(\/|$)/,
-  /^\.ponpoko(\/|$)/,
-  /^\.env($|\.)/,
-  /\.sqlite3?(-wal|-shm)?$/i,
-  /\.log$/i,
-  /^\.DS_Store$/,
-];
 
 export interface HostControlEndpoint {
   protocol?: number;
@@ -31,18 +23,50 @@ export interface HostControlEndpoint {
 
 export interface PublisherOptions {
   dataDir: string;
-  sourceRoots?: string[];
-  hostDbPath?: string;
   hostControlPath?: string;
   surfaceId?: string;
   fetchImpl?: typeof fetch;
   disableGhCli?: boolean;
+  onHostJob?: (requestId: string, operation: string) => Promise<void>;
+}
+
+interface HostJob<T> {
+  state: "running" | "completed" | "failed";
+  result?: T;
+  error?: string;
+}
+
+interface HostManagedSource {
+  source_id: string;
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  status: "installed" | "draft" | "registered";
+  revision: {
+    version: string;
+    source_digest: string;
+    git_head: string | null;
+  };
+  has_git: boolean;
+  has_package_json: boolean;
+  build_granted: boolean;
+}
+
+interface HostScanFinding {
+  path: string;
+  rule_id: string;
+  severity: SecretSeverity;
+  reason: string;
 }
 
 interface HostScanReport {
   clean: boolean;
+  blocked: boolean;
+  requires_review: boolean;
+  target_digest: string;
   scanned_files: number;
-  findings: SecurityFinding[];
+  findings: HostScanFinding[];
   excluded: string[];
 }
 
@@ -50,6 +74,7 @@ interface HostBuildReport {
   ok: boolean;
   failed_step?: string | null;
   bundle_root: string;
+  build_id?: string;
   steps?: Array<{ step: string; ok: boolean; detail: string }>;
 }
 
@@ -63,6 +88,47 @@ interface HostPackageReport {
     bundle_digest: string;
     files: Array<{ path: string; bytes: number; sha256: string; executable: boolean }>;
   };
+  scan?: HostScanReport;
+}
+
+interface HostGitPrepareReport {
+  staging_id: string;
+  commit: string;
+  repo: string;
+  branch: string;
+  files_count: number;
+  excluded: string[];
+  scan: HostScanReport;
+  preview: {
+    commits: number;
+    files: Array<{ path: string; status: string }>;
+    remote_slug: string | null;
+    consent: string | null;
+    blocked: string | null;
+  };
+}
+
+interface HostGitPushReport {
+  pushed: boolean;
+  branch: string | null;
+  remote: string | null;
+  detail: string;
+}
+
+interface GitHubRepository {
+  full_name: string;
+  html_url: string;
+  default_branch?: string;
+  created?: boolean;
+}
+
+interface GitHubRelease {
+  id: number;
+  html_url: string;
+  upload_url: string;
+  draft: boolean;
+  immutable: boolean;
+  tag_name: string;
 }
 
 interface StoredGitHubAuth {
@@ -70,72 +136,86 @@ interface StoredGitHubAuth {
   username: string;
 }
 
-function isExcludedPath(relPath: string): boolean {
-  return PACKAGE_EXCLUDE_PATTERNS.some((pattern) => pattern.test(relPath))
-    || relPath.split("/").some((segment) => IGNORED_DIRS.has(segment));
+type PreparedPublication =
+  | { sourceId: string; result: SourcePrepareResult }
+  | { sourceId: string; result: PackagePrepareResult; distribution: HostGitPrepareReport; notes?: string };
+
+const OWNER_ACCOUNT_RE = /^acct_[A-Za-z0-9_-]{1,80}$/;
+
+function mapScan(report: HostScanReport): SecurityScanResult {
+  return {
+    clean: report.clean,
+    blocked: report.blocked,
+    requiresReview: report.requires_review,
+    targetDigest: report.target_digest,
+    scannedFiles: report.scanned_files,
+    findings: report.findings.map((f) => ({
+      path: f.path,
+      ruleId: f.rule_id,
+      severity: f.severity,
+      reason: f.reason,
+    })),
+    excluded: report.excluded,
+  };
 }
 
-async function exists(path: string): Promise<boolean> {
-  try {
-    await stat(path);
-    return true;
-  } catch {
-    return false;
+function redactSecret(text: string, secret?: string | null): string {
+  let out = text.replace(/(https?:\/\/)[^/\s@]+@/g, "$1");
+  const clean = secret?.trim();
+  if (clean && clean.length >= 4) {
+    out = out.split(clean).join("[REDACTED]");
   }
+  return out;
 }
 
-async function walkFiles(
-  root: string,
-  current = root,
-  out: Array<{ abs: string; rel: string; size: number; mode: number }> = [],
-  excluded: string[] = [],
-): Promise<{ files: Array<{ abs: string; rel: string; size: number; mode: number }>; excluded: string[] }> {
-  const entries = await readdir(current, { withFileTypes: true });
-  for (const entry of entries) {
-    const abs = join(current, entry.name);
-    const rel = relative(root, abs).split("\\").join("/");
-    if (entry.isSymbolicLink()) {
-      excluded.push(rel);
-      continue;
-    }
-    if (entry.isDirectory()) {
-      if (IGNORED_DIRS.has(entry.name)) {
-        excluded.push(`${rel}/`);
-        continue;
-      }
-      await walkFiles(root, abs, out, excluded);
-      continue;
-    }
-    if (isExcludedPath(rel)) {
-      excluded.push(rel);
-      continue;
-    }
-    const info = await stat(abs);
-    out.push({ abs, rel, size: info.size, mode: info.mode });
+function validateOwnerAccount(raw?: string): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  if (!OWNER_ACCOUNT_RE.test(trimmed)) {
+    throw new Error("Invalid Ponpoko Cloud account id (expected acct_...)");
   }
-  return { files: out, excluded };
+  return trimmed;
+}
+
+function verifyReviewAndRemote(
+  scan: SecurityScanResult,
+  confirmRemote: string | undefined,
+  resolvedRepo: string,
+  targetRef: string,
+  approval: PublicationApproval | undefined,
+): void {
+  if (scan.blocked) {
+    const details = scan.findings
+      .filter((f) => f.severity === "block")
+      .map((f) => `${f.path} [${f.ruleId}]: ${f.reason}`)
+      .join("; ");
+    throw new Error(`Security scan blocked publication: ${details}`);
+  }
+  if ((confirmRemote?.trim().toLowerCase() ?? "") !== resolvedRepo.toLowerCase()) {
+    throw new Error(`Please confirm the destination repository '${resolvedRepo}' before publishing.`);
+  }
+  if (!approval || approval.digest !== scan.targetDigest ||
+      approval.remote.toLowerCase() !== resolvedRepo.toLowerCase() || approval.targetRef !== targetRef ||
+      (scan.requiresReview && approval.acknowledgedWarnings !== true)) {
+    throw new Error("Publication requires your explicit review confirmation for this exact artifact/commit, remote, and branch/tag.");
+  }
 }
 
 export class PublisherService {
   private readonly dataDir: string;
-  private readonly sourceRoots: string[];
-  private readonly hostDbPath: string | null;
   private readonly hostControlPath: string | null;
   private readonly surfaceId: string;
   private readonly fetchImpl: typeof fetch;
   private readonly disableGhCli: boolean;
+  private readonly onHostJob: PublisherOptions["onHostJob"];
 
   constructor(options: PublisherOptions) {
     this.dataDir = resolve(options.dataDir);
-    const envRoots = process.env.PONPOKO_SOURCES_DIR
-      ? process.env.PONPOKO_SOURCES_DIR.split(":").map((item) => item.trim()).filter(Boolean)
-      : null;
-    this.sourceRoots = options.sourceRoots ?? envRoots ?? [join(homedir(), "ponpoko-surfaces")];
-    this.hostDbPath = options.hostDbPath ?? process.env.PONPOKO_HOST_DATABASE ?? null;
     this.hostControlPath = options.hostControlPath ?? process.env.PONPOKO_HOST_CONTROL ?? null;
     this.surfaceId = options.surfaceId ?? process.env.PONPOKO_SURFACE_ID ?? "surface-publisher";
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.disableGhCli = options.disableGhCli ?? false;
+    this.onHostJob = options.onHostJob;
   }
 
   private async callHostRuntime<T>(operation: string, extra: Record<string, unknown>): Promise<T> {
@@ -146,8 +226,13 @@ export class PublisherService {
     if (endpoint.protocol !== 1 || !endpoint.url || !endpoint.token) {
       throw new Error("Invalid Host control endpoint configuration.");
     }
+    const url = new URL(endpoint.url);
+    if (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      throw new Error("Host control endpoint must use loopback HTTP.");
+    }
     const response = await this.fetchImpl(endpoint.url, {
       method: "POST",
+      redirect: "error",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${endpoint.token}`,
@@ -166,8 +251,47 @@ export class PublisherService {
     return answer.snapshot;
   }
 
+  async hostJobStatus(requestId: string): Promise<HostJob<unknown>> {
+    return this.callHostRuntime("jobs.status", { request_id: requestId });
+  }
+
+  private async callHostJob<T>(operation: string, input: Record<string, unknown>): Promise<T> {
+    const id = randomUUID();
+    await this.onHostJob?.(id, operation);
+    let job = await this.callHostRuntime<HostJob<T>>("jobs.start", {
+      request_id: id, job_operation: operation, input,
+    });
+    while (job.state === "running") {
+      await Bun.sleep(200);
+      job = await this.callHostRuntime<HostJob<T>>("jobs.status", { request_id: id });
+    }
+    if (job.state !== "completed" || job.result === undefined) {
+      throw new Error(job.error ?? "Host did not record a job outcome.");
+    }
+    return job.result;
+  }
+
+  private async savePreparation(prepared: PreparedPublication): Promise<void> {
+    const dir = join(this.dataDir, "publication-previews");
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(dir, `${prepared.result.preparedId}.json`), JSON.stringify(prepared), { flag: "wx", mode: 0o600 });
+  }
+
+  private async loadPreparation(id: string | undefined, sourceId: string): Promise<PreparedPublication> {
+    if (!id || !/^[a-f0-9-]{36}$/.test(id)) throw new Error("Prepare and review the publication first.");
+    const path = join(this.dataDir, "publication-previews", `${id}.json`);
+    const prepared = await readFile(path, "utf8").then(text => JSON.parse(text) as PreparedPublication)
+      .catch(() => { throw new Error("Prepared publication is unavailable. Prepare and review it again."); });
+    if (prepared.sourceId !== sourceId) throw new Error("Selected source changed after review.");
+    return prepared;
+  }
+
   private authPath(): string {
     return join(this.dataDir, "github-auth.json");
+  }
+
+  private async cleanupLegacyGitPublish(): Promise<void> {
+    await rm(join(this.dataDir, "git-publish"), { recursive: true, force: true }).catch(() => {});
   }
 
   private async readStoredAuth(): Promise<StoredGitHubAuth | null> {
@@ -202,98 +326,49 @@ export class PublisherService {
     return { id: "surface-publisher", name: "Publisher", version: "1.0.0" };
   }
 
-  private async discoverDbSourcePaths(): Promise<string[]> {
-    if (!this.hostDbPath || !(await exists(this.hostDbPath))) return [];
-    try {
-      const { Database } = await import("bun:sqlite");
-      const db = new Database(this.hostDbPath, { readonly: true });
-      try {
-        const rows = db.query("SELECT origin_json FROM surface_install").all() as Array<{ origin_json?: string }>;
-        const paths: string[] = [];
-        for (const row of rows) {
-          if (!row.origin_json) continue;
-          const parsed = JSON.parse(row.origin_json) as {
-            editable_source?: string;
-            source?: string;
-            kind?: string;
-          };
-          const candidate = parsed.editable_source ?? parsed.source;
-          if (typeof candidate === "string" && candidate.trim().length > 0) {
-            paths.push(candidate.trim());
-          }
-        }
-        return paths;
-      } finally {
-        db.close();
-      }
-    } catch {
-      return [];
-    }
+  async cloudAccount(): Promise<{ accountId: string | null }> {
+    const res = await this.callHostRuntime<{ account_id: string | null }>("cloud.account", {});
+    return { accountId: res.account_id ?? null };
   }
 
-  async listSources(rootsOverride?: string[]): Promise<LocalSurfaceSource[]> {
-    const candidateDirs = new Set<string>();
-    const roots = rootsOverride && rootsOverride.length > 0 ? rootsOverride : this.sourceRoots;
-    for (const root of roots) {
-      if (!(await exists(root))) continue;
-      if (await exists(join(root, "surface.json"))) {
-        candidateDirs.add(resolve(root));
-        continue;
-      }
-      for (const entry of await readdir(root, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const dir = join(root, entry.name);
-        if (await exists(join(dir, "surface.json"))) {
-          candidateDirs.add(resolve(dir));
-        }
-      }
-    }
-    if (!rootsOverride) {
-      for (const dbDir of await this.discoverDbSourcePaths()) {
-        if (await exists(join(dbDir, "surface.json"))) {
-          candidateDirs.add(resolve(dbDir));
-        }
-      }
-    }
-
-    const sources: LocalSurfaceSource[] = [];
-    for (const dir of candidateDirs) {
-      try {
-        const manifest = JSON.parse(await readFile(join(dir, "surface.json"), "utf8")) as {
-          id?: string;
-          name?: string;
-          version?: string;
-          description?: string;
-        };
-        if (!manifest.id || manifest.id === "surface-publisher") continue;
-        sources.push({
-          id: manifest.id,
-          name: manifest.name ?? manifest.id,
-          version: manifest.version ?? "0.1.0",
-          description: manifest.description ?? "",
-          path: dir,
-          hasGit: await exists(join(dir, ".git")),
-          hasPackageJson: await exists(join(dir, "package.json")),
-        });
-      } catch {
-        continue;
-      }
-    }
-    return sources.sort((a, b) => a.name.localeCompare(b.name));
+  async listSources(): Promise<LocalSurfaceSource[]> {
+    const rows = await this.callHostJob<HostManagedSource[]>("sources.list", {});
+    return rows.map((row) => ({
+      sourceId: row.source_id,
+      id: row.id,
+      name: row.name,
+      version: row.version,
+      description: row.description,
+      status: row.status,
+      revision: {
+        version: row.revision.version,
+        sourceDigest: row.revision.source_digest,
+        gitHead: row.revision.git_head,
+      },
+      hasGit: row.has_git,
+      hasPackageJson: row.has_package_json,
+      buildGranted: row.build_granted,
+    }));
   }
 
-  async scanSecurity(surfacePath: string): Promise<SecurityScanResult> {
-    const root = resolve(surfacePath);
-    if (!(await exists(join(root, "surface.json")))) {
-      throw new Error(`surface.json not found at ${root}`);
-    }
-    const report = await this.callHostRuntime<HostScanReport>("package.scan_secrets", { path: root });
-    return {
-      clean: report.clean,
-      scannedFiles: report.scanned_files,
-      findings: report.findings,
-      excluded: report.excluded,
-    };
+  async pickSource(): Promise<string | null> {
+    const registered = await this.callHostJob<HostManagedSource | null>("sources.pick", {});
+    return registered?.source_id ?? null;
+  }
+
+  async requestBuild(sourceId: string): Promise<{ sourceId: string; buildGranted: boolean }> {
+    const res = await this.callHostJob<{ source_id: string; build_granted: boolean }>(
+      "sources.request_build",
+      { source_id: sourceId },
+    );
+    return { sourceId: res.source_id, buildGranted: res.build_granted };
+  }
+
+  async scanSecurity(sourceId: string): Promise<SecurityScanResult> {
+    const report = await this.callHostJob<HostScanReport>("package.scan_secrets", {
+      source_id: sourceId,
+    });
+    return mapScan(report);
   }
 
   async githubStatus(): Promise<GitHubStatus> {
@@ -355,249 +430,299 @@ export class PublisherService {
     throw new Error("Please connect your GitHub account before publishing");
   }
 
-  private async ensureGitHubRepo(token: string, repoSlug: string, description: string): Promise<{ html_url: string; full_name: string }> {
-    const check = await this.fetchImpl(`https://api.github.com/repos/${repoSlug}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "ponpoko-surface-publisher",
-      },
-    });
-    if (check.ok) {
-      return (await check.json()) as { html_url: string; full_name: string };
+  private async resolveRepoSlug(repoInput?: string, surfaceId?: string): Promise<{ slug: string; auth: { token: string; username: string } | null }> {
+    const raw = repoInput?.trim();
+    const auth = await this.activeToken().catch(() => null);
+    const slug = raw?.includes("/") ? raw : `${auth?.username ?? "local"}/${raw || `ponpoko-${surfaceId ?? "surface"}`}`;
+    if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(slug) || /\/(?:\.|\.\.)$/.test(slug)) {
+      throw new Error("Expected a GitHub repository name or owner/repo.");
     }
-    const repoName = repoSlug.includes("/") ? repoSlug.split("/")[1] : repoSlug;
-    const create = await this.fetchImpl("https://api.github.com/user/repos", {
+    return { slug, auth };
+  }
+
+  private async githubRequest(path: string, token: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    headers.set("Accept", "application/vnd.github+json");
+    headers.set("User-Agent", "ponpoko-surface-publisher");
+    headers.set("X-GitHub-Api-Version", "2026-03-10");
+    return this.fetchImpl(`https://api.github.com${path}`, {
+      ...init, headers, redirect: "error", signal: AbortSignal.timeout(30_000),
+    });
+  }
+
+  private async findGitHubRepo(token: string, repo: string): Promise<GitHubRepository | null> {
+    const response = await this.githubRequest(`/repos/${repo}`, token);
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`Could not verify GitHub repository '${repo}' (HTTP ${response.status}).`);
+    const result = await response.json() as GitHubRepository;
+    if (result.full_name?.toLowerCase() !== repo.toLowerCase()) {
+      throw new Error("GitHub returned a repository other than the reviewed destination.");
+    }
+    return { ...result, created: false };
+  }
+
+  private async ensureGitHubRepo(auth: StoredGitHubAuth, repo: string, description: string): Promise<GitHubRepository> {
+    const existing = await this.findGitHubRepo(auth.token, repo);
+    if (existing) return existing;
+    const [owner, name] = repo.split("/");
+    if (owner?.toLowerCase() !== auth.username.toLowerCase()) {
+      throw new Error("Create the destination repository in the selected account or organization first.");
+    }
+    const response = await this.githubRequest("/user/repos", auth.token, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "ponpoko-surface-publisher",
-      },
-      body: JSON.stringify({
-        name: repoName,
-        description,
-        private: false,
-        auto_init: false,
-      }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, description, private: false, auto_init: false }),
     });
-    if (!create.ok) {
-      const errText = await create.text();
-      throw new Error(`Could not create GitHub repository '${repoSlug}': ${create.status} ${errText}`);
+    if (!response.ok) {
+      throw new Error(`Could not create GitHub repository '${repo}' (HTTP ${response.status}).`);
     }
-    return (await create.json()) as { html_url: string; full_name: string };
+    const result = await response.json() as GitHubRepository;
+    if (result.full_name?.toLowerCase() !== repo.toLowerCase()) {
+      throw new Error("GitHub created a repository other than the reviewed destination. Inspect it before retrying.");
+    }
+    return { ...result, created: true };
+  }
+
+  async preparePackage(params: PublishPackageParams): Promise<PackagePrepareResult> {
+    await this.cleanupLegacyGitPublish();
+    const ownerAccount = validateOwnerAccount(params.ownerAccount);
+    const sources = await this.listSources();
+    const source = sources.find((row) => row.sourceId === params.sourceId);
+    if (!source) throw new Error(`Unknown sourceId '${params.sourceId}'`);
+
+    let buildId: string | undefined;
+    if (!params.skipBuild && source.hasPackageJson) {
+      if (!source.buildGranted) await this.requestBuild(source.sourceId);
+      const build = await this.callHostJob<HostBuildReport>("package.build", { source_id: source.sourceId });
+      if (!build.ok || !build.build_id) {
+        const detail = build.steps?.find((step) => !step.ok)?.detail || build.failed_step || "build step failed";
+        throw new Error(`Build failed: ${detail}`);
+      }
+      buildId = build.build_id;
+    }
+
+    const preparedId = randomUUID();
+    const output = `packages/${preparedId}.surface`;
+    const packed = await this.callHostJob<HostPackageReport>("package.pack", {
+      ...(buildId ? { build_id: buildId } : { source_id: source.sourceId }), output,
+    });
+    const archiveScan = mapScan(packed.scan ?? await this.callHostJob<HostScanReport>(
+      "package.scan_secrets", { package_path: output },
+    ));
+    if (packed.metadata.id !== source.id || archiveScan.targetDigest !== packed.sha256) {
+      throw new Error("Prepared package identity or file digest changed. Prepare it again.");
+    }
+    const version = packed.metadata.version;
+    const tag = params.tag?.trim() || `v${version}`;
+    const { slug, auth } = await this.resolveRepoSlug(params.repo, source.id);
+    const existing = auth ? await this.findGitHubRepo(auth.token, slug) : null;
+    const distribution = await this.callHostJob<HostGitPrepareReport>("git.prepare_publication", {
+      source_id: source.sourceId,
+      kind: "distribution",
+      repo: slug,
+      branch: existing?.default_branch || "main",
+      owner_account: ownerAccount,
+      message: `Publish ${source.id} ${tag} distribution metadata`,
+      github_token: auth?.token,
+      author_name: auth?.username,
+      author_email: auth ? `${auth.username}@users.noreply.github.com` : undefined,
+    });
+    const distributionScan = mapScan(distribution.scan);
+    const blocked = archiveScan.blocked || distributionScan.blocked;
+    const scan = {
+      ...archiveScan,
+      clean: archiveScan.clean && distributionScan.clean,
+      blocked,
+      requiresReview: !blocked && (archiveScan.requiresReview || distributionScan.requiresReview),
+      findings: [...archiveScan.findings, ...distributionScan.findings],
+      scannedFiles: archiveScan.scannedFiles + distributionScan.scannedFiles,
+    };
+    const result: PackagePrepareResult = {
+      ok: true, mode: "use_only", preparedId, surfaceId: source.id,
+      version, repo: slug, tag, packagePath: packed.path, archiveSha256: packed.sha256,
+      archiveBytes: packed.archive_bytes, bundleDigest: packed.metadata.bundle_digest,
+      filesCount: packed.metadata.files.length, excluded: scan.excluded, scan, consentPrompt: slug,
+      distribution: { commit: distribution.commit, branch: distribution.branch, files: distribution.preview.files },
+    };
+    await this.savePreparation({ sourceId: source.sourceId, result, distribution, notes: params.notes?.trim() });
+    return result;
+  }
+
+  private async releasePackage(prepared: PackagePrepareResult, targetCommit: string, notes: string | undefined, archive: Uint8Array<ArrayBuffer>, token: string): Promise<string> {
+    const releases = `/repos/${prepared.repo}/releases`;
+    const create = await this.githubRequest(releases, token, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tag_name: prepared.tag, target_commitish: targetCommit,
+        name: `${prepared.surfaceId} ${prepared.tag}`,
+        body: notes || `Bundle digest: ${prepared.bundleDigest}\nArchive SHA-256: ${prepared.archiveSha256}`,
+        draft: true, prerelease: prepared.version.split("+")[0].includes("-"),
+      }),
+    }).catch(() => { throw new Error(`Draft creation outcome is unknown. Inspect ${prepared.repo} at ${prepared.tag} before retrying.`); });
+    if (!create.ok) throw new Error(`GitHub draft release creation failed (HTTP ${create.status}). Inspect ${prepared.repo} at ${prepared.tag} before retrying.`);
+    const draft = await create.json().catch(() => null) as GitHubRelease | null;
+    if (!draft || !Number.isSafeInteger(draft.id) || draft.id < 1 || draft.draft !== true) {
+      throw new Error(`GitHub did not confirm a draft release. Inspect ${prepared.repo} at ${prepared.tag} before retrying.`);
+    }
+    const release = `${releases}/${draft.id}`;
+    try {
+      const upload = new URL(draft.upload_url.split("{")[0]);
+      if (upload.origin !== "https://uploads.github.com" || upload.username || upload.password ||
+          upload.pathname.toLowerCase() !== `/repos/${prepared.repo}/releases/${draft.id}/assets`.toLowerCase()) {
+        throw new Error("GitHub returned an unexpected release upload destination.");
+      }
+      upload.searchParams.set("name", `${prepared.surfaceId}-${prepared.version}.surface`);
+      const response = await this.fetchImpl(upload.toString(), {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(300_000),
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+        body: archive,
+      });
+      if (!response.ok) throw new Error(`Uploading .surface asset failed (HTTP ${response.status}).`);
+      const asset = await response.json() as { state?: string; digest?: string; size?: number };
+      if (asset.state !== "uploaded" || asset.digest !== `sha256:${prepared.archiveSha256}` || asset.size !== archive.byteLength) {
+        throw new Error("GitHub did not verify the reviewed archive bytes.");
+      }
+    } catch (error) {
+      const current = await this.readRelease(release, token);
+      const removed = current?.id === draft.id && current.draft === true && (await this.githubRequest(release, token, { method: "DELETE" })
+        .catch(() => null))?.ok === true;
+      const result = removed ? "The draft was removed." : `Inspect GitHub release ${draft.id} before retrying.`;
+      throw new Error(`${redactSecret(error instanceof Error ? error.message : String(error), token)} ${result}`);
+    }
+
+    const published = await this.githubRequest(release, token, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ draft: false }),
+    }).then(async response => response.ok ? await response.json() as GitHubRelease : null).catch(() => null);
+    const current = published?.draft === false && published.immutable === true ? published : await this.readRelease(release, token);
+    if (current?.id === draft.id && current.draft === false && current.immutable === true &&
+        current.tag_name === prepared.tag && current.html_url) {
+      const commit = await this.readTagCommit(prepared.repo, prepared.tag, token).catch(() => null);
+      if (commit === targetCommit) return current.html_url;
+      throw new Error(`GitHub did not confirm the reviewed tag commit. Inspect release ${draft.id} before retrying.`);
+    }
+    throw new Error(`GitHub did not confirm an immutable release. Inspect ${prepared.repo} release ${draft.id} before retrying.`);
+  }
+
+  private async readRelease(path: string, token: string): Promise<GitHubRelease | null> {
+    return this.githubRequest(path, token).then(async response => response.ok ? await response.json() as GitHubRelease : null)
+      .catch(() => null);
+  }
+
+  private async readTagCommit(repo: string, tag: string, token: string): Promise<string | null> {
+    let path = `/repos/${repo}/git/ref/tags/${encodeURIComponent(tag)}`;
+    for (let depth = 0; depth < 5; depth++) {
+      const response = await this.githubRequest(path, token);
+      if (!response.ok) return null;
+      const { object } = await response.json() as { object?: { type: string; sha: string } };
+      if (!object || !/^[a-f0-9]{40}$/.test(object.sha)) return null;
+      if (object.type === "commit") return object.sha;
+      if (object.type !== "tag") return null;
+      path = `/repos/${repo}/git/tags/${object.sha}`;
+    }
+    return null;
   }
 
   async publishPackage(params: PublishPackageParams): Promise<PublishPackageResult> {
-    const root = resolve(params.path);
-    const scan = await this.scanSecurity(root);
-    if (!scan.clean) {
-      const details = scan.findings.map((f) => `${f.path}: ${f.reason}`).join("; ");
-      throw new Error(`Security scan blocked publication: ${details}`);
-    }
-
-    const manifest = JSON.parse(await readFile(join(root, "surface.json"), "utf8")) as {
-      id: string;
-      name?: string;
-      version?: string;
-      description?: string;
+    const saved = await this.loadPreparation(params.preparedId, params.sourceId);
+    if (!("distribution" in saved)) throw new Error("Prepare a package for this publication.");
+    const { result: prepared, distribution, notes } = saved;
+    if (prepared.scan.blocked) throw new Error("Security scan blocked publication.");
+    const result = {
+      ok: true, mode: "use_only" as const, dryRun: Boolean(params.dryRun), surfaceId: prepared.surfaceId,
+      version: prepared.version, repo: prepared.repo, tag: prepared.tag, packagePath: prepared.packagePath,
+      bundleDigest: prepared.bundleDigest, archiveSha256: prepared.archiveSha256,
+      filesCount: prepared.filesCount, excluded: prepared.excluded,
     };
-    const surfaceId = manifest.id;
-    const version = manifest.version ?? "0.1.0";
-    const tag = params.tag?.trim() || `v${version}`;
-
-    let bundleSourceDir = root;
-    if (!params.skipBuild && (await exists(join(root, "package.json")))) {
-      const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as { scripts?: Record<string, string> };
-      if (pkg.scripts?.build) {
-        const build = await this.callHostRuntime<HostBuildReport>("package.build", { path: root });
-        if (!build.ok) {
-          const detail = build.steps?.find((step) => !step.ok)?.detail || build.failed_step || "build step failed";
-          throw new Error(`Build failed: ${detail}`);
-        }
-        bundleSourceDir = build.bundle_root;
-      }
-    } else if (await exists(join(root, "dist", "surface.json"))) {
-      bundleSourceDir = join(root, "dist");
-    }
-
-    const archiveDir = join(this.dataDir, "packages");
-    await mkdir(archiveDir, { recursive: true });
-    const packagePath = join(archiveDir, `${surfaceId}-${version}.surface`);
-    await rm(packagePath, { force: true });
-
-    const packed = await this.callHostRuntime<HostPackageReport>("package.pack", {
-      bundle: bundleSourceDir,
-      output: packagePath,
-    });
-    const bundleDigest = packed.metadata.bundle_digest;
-    const filesCount = packed.metadata.files.length;
-
-    const repoSlug = params.repo?.trim() || `local/${surfaceId}`;
     if (params.dryRun) {
-      return {
-        ok: true,
-        mode: "use_only",
-        dryRun: true,
-        surfaceId,
-        version,
-        repo: repoSlug,
-        tag,
-        packagePath: packed.path,
-        bundleDigest,
-        filesCount,
-        excluded: scan.excluded,
-        releaseUrl: `https://github.com/${repoSlug}/releases/tag/${tag}`,
-      };
+      return { ...result, releaseUrl: `https://github.com/${prepared.repo}/releases/tag/${prepared.tag}` };
     }
 
+    verifyReviewAndRemote(prepared.scan, params.confirmRemote, prepared.repo, prepared.tag, params.approval);
+    if (params.approval?.distributionDigest !== distribution.commit) {
+      throw new Error("The distribution commit needs explicit review confirmation.");
+    }
+    const archive = await readFile(prepared.packagePath);
+    if (archive.length !== prepared.archiveBytes || createHash("sha256").update(archive).digest("hex") !== prepared.archiveSha256) {
+      throw new Error("The archive changed after review. Prepare and review it again.");
+    }
     const auth = await this.activeToken();
-    const resolvedRepo = params.repo?.trim().includes("/")
-      ? params.repo.trim()
-      : `${auth.username}/${params.repo?.trim() || `ponpoko-${surfaceId}`}`;
-    await this.ensureGitHubRepo(auth.token, resolvedRepo, manifest.description ?? `${manifest.name ?? surfaceId} for Ponpoko`);
-
-    const releaseResp = await this.fetchImpl(`https://api.github.com/repos/${resolvedRepo}/releases`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "ponpoko-surface-publisher",
-      },
-      body: JSON.stringify({
-        tag_name: tag,
-        name: `${manifest.name ?? surfaceId} ${tag}`,
-        body: params.notes?.trim() || `Published with Ponpoko Publisher.\n\nbundle_digest: ${bundleDigest}`,
-        draft: false,
-        prerelease: false,
-      }),
-    });
-    if (!releaseResp.ok) {
-      throw new Error(`GitHub Release creation failed: ${releaseResp.status} ${await releaseResp.text()}`);
+    const repo = await this.ensureGitHubRepo(auth, prepared.repo, `${prepared.surfaceId} for Ponpoko`);
+    if ((repo.default_branch || "main") !== distribution.branch) {
+      throw new Error("The default branch changed after review. Prepare and review it again.");
     }
-    const release = (await releaseResp.json()) as { upload_url: string; html_url: string };
-    const uploadBase = release.upload_url.split("{")[0];
-    const archiveBytes = await readFile(packed.path);
-    const assetName = `${surfaceId}-${version}.surface`;
-    const uploadResp = await this.fetchImpl(`${uploadBase}?name=${encodeURIComponent(assetName)}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${auth.token}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/octet-stream",
-        "User-Agent": "ponpoko-surface-publisher",
-      },
-      body: archiveBytes,
-    });
-    if (!uploadResp.ok) {
-      throw new Error(`Uploading .surface asset failed: ${uploadResp.status} ${await uploadResp.text()}`);
+    const immutablePath = `/repos/${prepared.repo}/immutable-releases`;
+    const immutable = await this.githubRequest(immutablePath, auth.token);
+    if (immutable.status === 404 && repo.created) {
+      const enabled = await this.githubRequest(immutablePath, auth.token, { method: "PUT" });
+      if (!enabled.ok) throw new Error("Could not enable immutable releases on the new repository.");
+    } else if (!immutable.ok) {
+      throw new Error("Enable immutable releases in the destination repository before publishing.");
     }
+    const tag = await this.githubRequest(`/repos/${prepared.repo}/git/ref/tags/${encodeURIComponent(prepared.tag)}`, auth.token);
+    if (tag.ok) throw new Error(`Tag '${prepared.tag}' already exists on ${prepared.repo}. Bump the version before publishing an update.`);
+    if (tag.status !== 404) throw new Error(`Could not verify the release tag (HTTP ${tag.status}).`);
+    await this.pushReviewedCommit(distribution.staging_id, prepared.repo, distribution.branch,
+      distribution.commit, params.approval.acknowledgedWarnings, auth.token);
+    const releaseUrl = await this.releasePackage(prepared, distribution.commit, notes, archive, auth.token)
+      .catch((error: unknown) => {
+        throw new Error(`Distribution commit ${distribution.commit} was pushed. ${error instanceof Error ? error.message : String(error)}`);
+      });
+    return { ...result, releaseUrl };
+  }
 
-    return {
-      ok: true,
-      mode: "use_only",
-      dryRun: false,
-      surfaceId,
-      version,
-      repo: resolvedRepo,
-      tag,
-      packagePath: packed.path,
-      bundleDigest,
-      filesCount,
-      excluded: scan.excluded,
-      releaseUrl: release.html_url,
+  private async pushReviewedCommit(stagingId: string, repo: string, branch: string, commit: string, warnings: boolean, token: string) {
+    const pushed = await this.callHostJob<HostGitPushReport>("git.push_publication", {
+      staging_id: stagingId, confirm_remote: repo, expected_remote: repo, github_token: token,
+      approval: { digest: commit, remote: repo, target_ref: branch, acknowledged_warnings: warnings },
+    });
+    if (!pushed.pushed) throw new Error(redactSecret(pushed.detail || "Git push failed", token));
+  }
+
+  async prepareSource(params: PublishSourceParams): Promise<SourcePrepareResult> {
+    await this.cleanupLegacyGitPublish();
+    const ownerAccount = validateOwnerAccount(params.ownerAccount);
+    const sources = await this.listSources();
+    const source = sources.find((row) => row.sourceId === params.sourceId);
+    if (!source) throw new Error(`Unknown sourceId '${params.sourceId}'`);
+    const branch = params.branch?.trim() || "main";
+    const { slug, auth } = await this.resolveRepoSlug(params.repo, source.id);
+    const prepared = await this.callHostJob<HostGitPrepareReport>("git.prepare_publication", {
+      source_id: source.sourceId, kind: "source", repo: slug, branch, owner_account: ownerAccount,
+      message: params.message?.trim() || undefined, github_token: auth?.token,
+      author_name: auth?.username,
+      author_email: auth ? `${auth.username}@users.noreply.github.com` : undefined,
+    });
+    const result: SourcePrepareResult = {
+      ok: true, mode: "open_source", preparedId: randomUUID(), surfaceId: source.id,
+      repo: prepared.repo, branch: prepared.branch, stagingId: prepared.staging_id, commit: prepared.commit,
+      filesCount: prepared.files_count, excluded: prepared.excluded, scan: mapScan(prepared.scan),
+      preview: {
+        commits: prepared.preview.commits, files: prepared.preview.files, remoteSlug: prepared.preview.remote_slug,
+        consent: prepared.preview.consent, blocked: prepared.preview.blocked,
+      },
     };
+    await this.savePreparation({ sourceId: source.sourceId, result });
+    return result;
   }
 
   async publishSource(params: PublishSourceParams): Promise<PublishSourceResult> {
-    const root = resolve(params.path);
-    const scan = await this.scanSecurity(root);
-    if (!scan.clean) {
-      const details = scan.findings.map((f) => `${f.path}: ${f.reason}`).join("; ");
-      throw new Error(`Security scan blocked publication: ${details}`);
-    }
-
-    const manifest = JSON.parse(await readFile(join(root, "surface.json"), "utf8")) as {
-      id: string;
-      name?: string;
-      description?: string;
+    const saved = await this.loadPreparation(params.preparedId, params.sourceId);
+    if ("distribution" in saved) throw new Error("Prepare a source commit for this publication.");
+    const prepared = saved.result;
+    if (prepared.scan.blocked) throw new Error("Security scan blocked publication.");
+    const result = {
+      ok: true, mode: "open_source" as const, dryRun: Boolean(params.dryRun), surfaceId: prepared.surfaceId,
+      repo: prepared.repo, branch: prepared.branch, commit: prepared.commit, excluded: prepared.excluded,
+      filesCount: prepared.filesCount,
     };
-    const surfaceId = manifest.id;
-    const branch = params.branch?.trim() || "main";
-    const { files } = await walkFiles(root);
-    const repoSlug = params.repo?.trim() || `local/${surfaceId}`;
-
-    if (params.dryRun) {
-      return {
-        ok: true,
-        mode: "open_source",
-        dryRun: true,
-        surfaceId,
-        repo: repoSlug,
-        branch,
-        commit: null,
-        repoUrl: `https://github.com/${repoSlug}`,
-        excluded: scan.excluded,
-        filesCount: files.length,
-      };
-    }
-
+    if (params.dryRun) return { ...result, repoUrl: `https://github.com/${prepared.repo}` };
+    verifyReviewAndRemote(prepared.scan, params.confirmRemote, prepared.repo, prepared.branch, params.approval);
     const auth = await this.activeToken();
-    const resolvedRepo = params.repo?.trim().includes("/")
-      ? params.repo.trim()
-      : `${auth.username}/${params.repo?.trim() || `ponpoko-${surfaceId}`}`;
-    const repoInfo = await this.ensureGitHubRepo(
-      auth.token,
-      resolvedRepo,
-      manifest.description ?? `${manifest.name ?? surfaceId} for Ponpoko`,
-    );
-
-    const workDir = join(this.dataDir, "git-publish", surfaceId);
-    await rm(workDir, { recursive: true, force: true });
-    await mkdir(workDir, { recursive: true });
-    for (const file of files) {
-      const dest = join(workDir, file.rel);
-      await mkdir(join(dest, ".."), { recursive: true });
-      await copyFile(file.abs, dest);
-    }
-
-    const gitignore = ["node_modules/", "dist/", ".ponpoko/", ".env", ".env.*", "*.sqlite", "*.sqlite3", "*.log", ".DS_Store"].join("\n");
-    await writeFile(join(workDir, ".gitignore"), `${gitignore}\n`);
-    if (params.ownerAccount) {
-      await writeFile(join(workDir, "PONPOKO.md"), `---\nowner: ${params.ownerAccount}\n---\n`);
-    }
-
-    const runGit = (args: string[]) => {
-      const res = Bun.spawnSync(["git", ...args], { cwd: workDir, stdout: "pipe", stderr: "pipe" });
-      if (res.exitCode !== 0) {
-        throw new Error(`git ${args[0]} failed: ${new TextDecoder().decode(res.stderr)}`);
-      }
-      return new TextDecoder().decode(res.stdout).trim();
-    };
-
-    runGit(["init", "-b", branch]);
-    runGit(["config", "user.name", auth.username]);
-    runGit(["config", "user.email", `${auth.username}@users.noreply.github.com`]);
-    runGit(["add", "."]);
-    runGit(["commit", "-m", params.message?.trim() || `Publish ${surfaceId} via Ponpoko Publisher`]);
-    const commit = runGit(["rev-parse", "HEAD"]);
-    const remoteUrl = `https://x-access-token:${auth.token}@github.com/${resolvedRepo}.git`;
-    runGit(["remote", "add", "origin", remoteUrl]);
-    runGit(["push", "-u", "origin", branch]);
-
-    return {
-      ok: true,
-      mode: "open_source",
-      dryRun: false,
-      surfaceId,
-      repo: resolvedRepo,
-      branch,
-      commit,
-      repoUrl: repoInfo.html_url,
-      excluded: scan.excluded,
-      filesCount: files.length,
-    };
+    const repo = await this.ensureGitHubRepo(auth, prepared.repo, `${prepared.surfaceId} for Ponpoko`);
+    await this.pushReviewedCommit(prepared.stagingId, prepared.repo, prepared.branch, prepared.commit,
+      params.approval?.acknowledgedWarnings === true, auth.token);
+    return { ...result, repoUrl: repo.html_url };
   }
 }
