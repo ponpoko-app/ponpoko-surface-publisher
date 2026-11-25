@@ -16,6 +16,7 @@ import {
 import type {
   GitHubStatus,
   LocalSurfaceSource,
+  PackageCompatibility,
   PackagePrepareResult,
   PublishPackageResult,
   PublishSourceResult,
@@ -29,6 +30,13 @@ function statusLabel(status: LocalSurfaceSource["status"]): string {
   if (status === "draft") return "Draft (รอปรับใช้)";
   if (status === "installed") return "Installed";
   return "Registered";
+}
+
+function PackageRequirements({ compatibility }: { compatibility: PackageCompatibility }) {
+  return <p className="muted">
+    แพ็กเกจสำหรับ {compatibility.target === "any" ? "ทุกแพลตฟอร์มที่ Ponpoko รองรับ" : compatibility.platform}
+    {" · "}ต้องใช้ Ponpoko {compatibility.minimumHostVersion} ขึ้นไป
+  </p>;
 }
 
 export function App({ client }: { client: PublisherClient }) {
@@ -469,10 +477,16 @@ export function App({ client }: { client: PublisherClient }) {
                     {prepared.filesCount}
                   </p>
                   {prepared.mode === "use_only" && (
-                    <p className="muted">
-                      Distribution branch <code>{prepared.distribution.branch}</code> · Commit{" "}
-                      <code>{prepared.distribution.commit.slice(0, 12)}</code> · Immutable release
-                    </p>
+                    <>
+                      {prepared.compatibility && <PackageRequirements compatibility={prepared.compatibility} />}
+                      {prepared.compatibility && prepared.compatibility.target !== "any" && (
+                        <p className="muted">ถ้าผู้รับใช้ระบบปฏิบัติการหรือสถาปัตยกรรมอื่น จะต้องใช้แพ็กเกจที่ build มาตรงกับเครื่องของเขา</p>
+                      )}
+                      <p className="muted">
+                        Distribution branch <code>{prepared.distribution.branch}</code> · Commit{" "}
+                        <code>{prepared.distribution.commit.slice(0, 12)}</code> · Immutable release
+                      </p>
+                    </>
                   )}
                   <details>
                     <summary>ไฟล์ที่จะเปลี่ยนใน Git</summary>
@@ -541,6 +555,9 @@ export function App({ client }: { client: PublisherClient }) {
                   <p className="muted" style={{ marginTop: 8 }}>
                     Repo: <code>{published.repo}</code> · จำนวนไฟล์: {published.filesCount}
                   </p>
+                  {published.mode === "use_only" && published.compatibility && (
+                    <PackageRequirements compatibility={published.compatibility} />
+                  )}
                   <p className="muted">
                     ลิงก์:{" "}
                     <button

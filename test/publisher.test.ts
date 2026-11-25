@@ -180,9 +180,11 @@ describe("surface-publisher backend", () => {
               path: archivePath,
               sha256,
               archive_bytes: archive.length,
+              target_label: "Mac (Apple Silicon)",
               metadata: {
                 id: "timer",
                 version: "1.2.3",
+                spec: { target: "darwin-aarch64", minimum_host_version: "0.20.2" },
                 bundle_digest: "bundle_sha_123",
                 files: [{ path: "index.html", bytes: 20, sha256: "f1", executable: false }],
               },
@@ -251,9 +253,10 @@ describe("surface-publisher backend", () => {
           : new Response("Not Found", { status: 404 });
       }
       if (url === "https://api.github.com/repos/alice/ponpoko-timer/releases" && method === "POST") {
-        const body = JSON.parse(String(init?.body ?? "{}")) as { draft?: boolean; target_commitish?: string };
+        const body = JSON.parse(String(init?.body ?? "{}")) as { draft?: boolean; target_commitish?: string; body?: string };
         expect(body.draft).toBe(true);
         expect(body.target_commitish).toBe(commit);
+        expect(body.body).toContain("Package for Mac (Apple Silicon). Requires Ponpoko 0.20.2 or later.");
         return Response.json({
           id: 99, draft: true,
           upload_url: "https://uploads.github.com/repos/alice/ponpoko-timer/releases/99/assets{?name,label}",
@@ -261,6 +264,7 @@ describe("surface-publisher backend", () => {
         });
       }
       if (url.startsWith("https://uploads.github.com/")) {
+        expect(new URL(url).searchParams.get("name")).toBe("timer-1.2.3-darwin-aarch64.surface");
         if (failUpload) {
           return new Response("upload aborted for ghp_secret_token_leak", { status: 502 });
         }
@@ -286,6 +290,7 @@ describe("surface-publisher backend", () => {
 
     const params = { sourceId: "src_timer", repo: "alice/ponpoko-timer", ownerAccount: "acct_alice" };
     const reviewed = await svc.preparePackage(params);
+    expect(reviewed.compatibility).toEqual({ target: "darwin-aarch64", platform: "Mac (Apple Silicon)", minimumHostVersion: "0.20.2" });
     await expect(svc.publishPackage({
       ...params, ...approve(reviewed), approval: { ...approve(reviewed).approval, digest: "stale" },
     })).rejects.toThrow("explicit review");
@@ -448,6 +453,7 @@ describe("surface-publisher backend", () => {
               metadata: {
                 id: "timer",
                 version,
+                spec: { target: "any", minimum_host_version: "0.20.2" },
                 bundle_digest: `b_${version}`,
                 files: [{ path: "index.html", bytes: 10, sha256: "f1", executable: false }],
               },

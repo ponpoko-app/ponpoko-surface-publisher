@@ -82,10 +82,12 @@ interface HostPackageReport {
   path: string;
   sha256: string;
   archive_bytes: number;
+  target_label?: string;
   metadata: {
     id: string;
     version: string;
     bundle_digest: string;
+    spec: { target: string; minimum_host_version: string };
     files: Array<{ path: string; bytes: number; sha256: string; executable: boolean }>;
   };
   scan?: HostScanReport;
@@ -538,10 +540,16 @@ export class PublisherService {
       findings: [...archiveScan.findings, ...distributionScan.findings],
       scannedFiles: archiveScan.scannedFiles + distributionScan.scannedFiles,
     };
+    const { target, minimum_host_version: minimumHostVersion } = packed.metadata.spec;
     const result: PackagePrepareResult = {
       ok: true, mode: "use_only", preparedId, surfaceId: source.id,
       version, repo: slug, tag, packagePath: packed.path, archiveSha256: packed.sha256,
       archiveBytes: packed.archive_bytes, bundleDigest: packed.metadata.bundle_digest,
+      compatibility: {
+        target,
+        platform: packed.target_label ?? (target === "any" ? "All Ponpoko platforms" : target),
+        minimumHostVersion,
+      },
       filesCount: packed.metadata.files.length, excluded: scan.excluded, scan, consentPrompt: slug,
       distribution: { commit: distribution.commit, branch: distribution.branch, files: distribution.preview.files },
     };
@@ -551,13 +559,18 @@ export class PublisherService {
 
   private async releasePackage(prepared: PackagePrepareResult, targetCommit: string, notes: string | undefined, archive: Uint8Array<ArrayBuffer>, token: string): Promise<string> {
     const releases = `/repos/${prepared.repo}/releases`;
+    const compatibility = prepared.compatibility;
+    const requirements = compatibility
+      ? `Package for ${compatibility.platform}. Requires Ponpoko ${compatibility.minimumHostVersion} or later.`
+      : "";
+    const body = [requirements, notes || `Bundle digest: ${prepared.bundleDigest}\nArchive SHA-256: ${prepared.archiveSha256}`].filter(Boolean).join("\n\n");
     const create = await this.githubRequest(releases, token, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         tag_name: prepared.tag, target_commitish: targetCommit,
         name: `${prepared.surfaceId} ${prepared.tag}`,
-        body: notes || `Bundle digest: ${prepared.bundleDigest}\nArchive SHA-256: ${prepared.archiveSha256}`,
+        body,
         draft: true, prerelease: prepared.version.split("+")[0].includes("-"),
       }),
     }).catch(() => { throw new Error(`Draft creation outcome is unknown. Inspect ${prepared.repo} at ${prepared.tag} before retrying.`); });
@@ -573,7 +586,8 @@ export class PublisherService {
           upload.pathname.toLowerCase() !== `/repos/${prepared.repo}/releases/${draft.id}/assets`.toLowerCase()) {
         throw new Error("GitHub returned an unexpected release upload destination.");
       }
-      upload.searchParams.set("name", `${prepared.surfaceId}-${prepared.version}.surface`);
+      const targetSuffix = compatibility ? `-${compatibility.target}` : "";
+      upload.searchParams.set("name", `${prepared.surfaceId}-${prepared.version}${targetSuffix}.surface`);
       const response = await this.fetchImpl(upload.toString(), {
         method: "POST", redirect: "error", signal: AbortSignal.timeout(300_000),
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
@@ -633,6 +647,7 @@ export class PublisherService {
       ok: true, mode: "use_only" as const, dryRun: Boolean(params.dryRun), surfaceId: prepared.surfaceId,
       version: prepared.version, repo: prepared.repo, tag: prepared.tag, packagePath: prepared.packagePath,
       bundleDigest: prepared.bundleDigest, archiveSha256: prepared.archiveSha256,
+      compatibility: prepared.compatibility,
       filesCount: prepared.filesCount, excluded: prepared.excluded,
     };
     if (params.dryRun) {

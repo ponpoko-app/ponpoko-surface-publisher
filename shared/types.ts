@@ -50,6 +50,12 @@ export interface GitHubStatus {
   source: "token" | "gh_cli" | "none";
 }
 
+export interface PackageCompatibility {
+  target: string;
+  platform: string;
+  minimumHostVersion: string;
+}
+
 export interface PackagePrepareResult {
   ok: true;
   mode: "use_only";
@@ -61,6 +67,7 @@ export interface PackagePrepareResult {
   packagePath: string;
   archiveSha256: string;
   archiveBytes: number;
+  compatibility?: PackageCompatibility;
   bundleDigest: string;
   filesCount: number;
   excluded: string[];
@@ -114,6 +121,7 @@ export interface PublishPackageResult {
   packagePath: string;
   bundleDigest: string;
   archiveSha256: string;
+  compatibility?: PackageCompatibility;
   filesCount: number;
   excluded: string[];
   releaseUrl: string;
