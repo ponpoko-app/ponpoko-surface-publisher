@@ -56,10 +56,7 @@ async function dispatch(method: string, params: Record<string, unknown>): Promis
     case "github.status":
       return service.githubStatus();
     case "github.connect":
-      return service.githubConnect(
-        String(params.token ?? ""),
-        typeof params.username === "string" ? params.username : undefined,
-      );
+      return service.githubConnect(String(params.token ?? ""));
     case "github.disconnect":
       return service.githubDisconnect();
     case "publish.prepare_package":

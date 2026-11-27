@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type {
@@ -298,8 +299,19 @@ export class PublisherService {
 
   private async readStoredAuth(): Promise<StoredGitHubAuth | null> {
     try {
-      const raw = await readFile(this.authPath(), "utf8");
-      const parsed = JSON.parse(raw) as Partial<StoredGitHubAuth>;
+      if (!(await lstat(this.authPath())).isFile()) return null;
+      const file = await open(this.authPath(), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+      let parsed: Partial<StoredGitHubAuth>;
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.size > 4096) return null;
+        const bytes = Buffer.alloc(4097);
+        const { bytesRead } = await file.read(bytes);
+        if (bytesRead > 4096) return null;
+        parsed = JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"));
+      } finally {
+        await file.close();
+      }
       if (typeof parsed.token === "string" && parsed.token.trim().length > 0) {
         return {
           token: parsed.token.trim(),
@@ -385,27 +397,24 @@ export class PublisherService {
     return { connected: false, username: null, source: "none" };
   }
 
-  async githubConnect(token: string, usernameOverride?: string): Promise<GitHubStatus> {
+  async githubConnect(token: string): Promise<GitHubStatus> {
     const clean = token.trim();
-    if (!clean) throw new Error("GitHub token is required");
-    let username = usernameOverride?.trim() ?? "";
-    if (!username) {
-      const response = await this.fetchImpl("https://api.github.com/user", {
-        headers: {
-          Authorization: `Bearer ${clean}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "ponpoko-surface-publisher",
-        },
-      });
-      if (!response.ok) {
-        throw new Error(`GitHub authentication failed (${response.status})`);
-      }
-      const user = (await response.json()) as { login?: string };
-      username = user.login ?? "github-user";
+    if (!/^[!-~]{1,1024}$/.test(clean)) throw new Error("A valid GitHub token is required");
+    const response = await this.githubRequest("/user", clean);
+    if (!response.ok) {
+      throw new Error(`GitHub authentication failed (${response.status})`);
     }
+    const user = (await response.json()) as { login?: string };
+    const username = user.login;
+    if (!username || !/^[a-z0-9-]{1,100}$/i.test(username)) throw new Error("Could not verify the GitHub account name");
     await mkdir(this.dataDir, { recursive: true });
-    await writeFile(this.authPath(), JSON.stringify({ token: clean, username }, null, 2), { mode: 0o600 });
-    await chmod(this.authPath(), 0o600);
+    const staged = join(this.dataDir, `.github-auth-${randomUUID()}.tmp`);
+    try {
+      await writeFile(staged, JSON.stringify({ token: clean, username }, null, 2), { flag: "wx", mode: 0o600 });
+      await rename(staged, this.authPath());
+    } finally {
+      await rm(staged, { force: true });
+    }
     return { connected: true, username, source: "token" };
   }
 
@@ -419,13 +428,7 @@ export class PublisherService {
     if (stored) return stored;
     const cli = this.readGhCliToken();
     if (cli) {
-      const resp = await this.fetchImpl("https://api.github.com/user", {
-        headers: {
-          Authorization: `Bearer ${cli}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "ponpoko-surface-publisher",
-        },
-      });
+      const resp = await this.githubRequest("/user", cli);
       const user = resp.ok ? ((await resp.json()) as { login?: string }) : {};
       return { token: cli, username: user.login ?? "github-user" };
     }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -19,6 +19,23 @@ afterEach(() => {
     const dir = temps.pop();
     if (dir) rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a linked auth file is ignored and connection verification never follows redirects", async () => {
+  const dataDir = makeTempDir("publisher-auth-");
+  const sentinel = join(dataDir, "sentinel.json");
+  writeFileSync(sentinel, JSON.stringify({ token: "fixture-only", username: "wrong" }));
+  symlinkSync(sentinel, join(dataDir, "github-auth.json"), "file");
+  const fetchImpl = (async (url: string, options?: RequestInit) => {
+    expect(url).toBe("https://api.github.com/user");
+    expect(options?.redirect).toBe("error");
+    return Response.json({ login: "verified" });
+  }) as typeof fetch;
+  const svc = new PublisherService({ dataDir, fetchImpl, disableGhCli: true });
+  expect(await svc.githubStatus()).toMatchObject({ connected: false });
+  expect(await svc.githubConnect("another-fixture")).toMatchObject({ username: "verified", connected: true });
+  expect(JSON.parse(readFileSync(sentinel, "utf8")).username).toBe("wrong");
+  expect(await svc.githubStatus()).toMatchObject({ username: "verified" });
 });
 
 function mockHostJobs(fetchImpl: typeof fetch): typeof fetch {
